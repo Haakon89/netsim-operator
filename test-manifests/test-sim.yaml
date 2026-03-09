@@ -1,0 +1,18 @@
+apiVersion: sim.example.local/v1alpha1
+kind: NetworkSimulation
+metadata:
+  name: demo
+  namespace: default
+spec:
+  deviceCount: 3
+  traffic:
+    steps:
+      - type: ping
+        from: device-0
+        to: device-1.devices
+        count: 5
+      - type: ping
+        from: device-1
+        to: device-2.devices
+        count: 5
+      
