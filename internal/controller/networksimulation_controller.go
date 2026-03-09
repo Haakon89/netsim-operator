@@ -37,12 +37,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	simv1alpha1 "github.com/Haakon89/netsim-operator/api/v1alpha1"
+	"github.com/go-logr/logr"
 )
 
 const (
 	simFinalizer = "sim.example.local/finalizer"
 	simLabelKey  = "sim.example.local/name"
 	roleLabelKey = "sim.example.local/role"
+	PhasePending = "Pending"
+	PhaseRunning = "Running"
+	PhaseReady   = "Ready"
+	RequeueTimer = 2 * time.Second
 )
 
 // NetworkSimulationReconciler reconciles a NetworkSimulation object
@@ -56,16 +61,9 @@ type NetworkSimulationReconciler struct {
 // +kubebuilder:rbac:groups=sim.example.local,resources=networksimulations/finalizers,verbs=update
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the NetworkSimulation object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.1/pkg/reconcile
 func (r *NetworkSimulationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -74,178 +72,276 @@ func (r *NetworkSimulationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 1) Handle deletion first (finalizer path)
-	if !sim.DeletionTimestamp.IsZero() {
-		if controllerutil.ContainsFinalizer(&sim, simFinalizer) {
-			// Delete the simulation namespace (if we created one)
-			if sim.Status.Namespace != "" {
-				ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: sim.Status.Namespace}}
-				if err := r.Delete(ctx, ns); err != nil && !apierrors.IsNotFound(err) {
+	if handled, result, err := r.handleDeletion(ctx, logger, &sim); handled {
+		return result, err
+	}
+	if handled, result, err := r.ensureFinalizer(ctx, &sim); handled {
+		return result, err
+	}
+
+	simNS := generateNamespace(&sim)
+
+	if err := r.reconcileInfrastructure(ctx, logger, &sim, simNS); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	phase, readyCount, result, err := r.reconcileReadiness(ctx, &sim, simNS)
+	if err != nil || !result.IsZero() {
+		return result, err
+	}
+
+	jobName, err := r.reconcileTraffic(ctx, logger, &sim, simNS)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileStatus(ctx, logger, &sim, simNS, phase, jobName); err != nil {
+		if apierrors.IsConflict(err) {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Reconciled simulation", "namespace", simNS, "phase", phase, "ready", readyCount)
+	return ctrl.Result{}, nil
+}
+
+func (r *NetworkSimulationReconciler) handleDeletion(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+) (bool, ctrl.Result, error) {
+	if sim.DeletionTimestamp.IsZero() {
+		return false, ctrl.Result{}, nil
+	}
+
+	if !controllerutil.ContainsFinalizer(sim, simFinalizer) {
+		return true, ctrl.Result{}, nil
+	}
+
+	if sim.Status.Namespace != "" {
+		var ns corev1.Namespace
+		err := r.Get(ctx, types.NamespacedName{Name: sim.Status.Namespace}, &ns)
+		if err == nil {
+			if ns.DeletionTimestamp.IsZero() {
+				if err := r.Delete(ctx, &ns); err != nil && !apierrors.IsNotFound(err) {
 					logger.Error(err, "Failed to delete simulation namespace", "namespace", sim.Status.Namespace)
-					return ctrl.Result{}, err
+					return true, ctrl.Result{}, err
 				}
 				logger.Info("Requested deletion of simulation namespace", "namespace", sim.Status.Namespace)
 			}
 
-			// Remove finalizer so the CR can be deleted
-			controllerutil.RemoveFinalizer(&sim, simFinalizer)
-			if err := r.Update(ctx, &sim); err != nil {
-				return ctrl.Result{}, err
-			}
+			return true, ctrl.Result{RequeueAfter: RequeueTimer}, nil
 		}
-		return ctrl.Result{}, nil
+
+		if !apierrors.IsNotFound(err) {
+			return true, ctrl.Result{}, err
+		}
 	}
 
-	// 2) Ensure finalizer exists
-	if !controllerutil.ContainsFinalizer(&sim, simFinalizer) {
-		controllerutil.AddFinalizer(&sim, simFinalizer)
-		if err := r.Update(ctx, &sim); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+	controllerutil.RemoveFinalizer(sim, simFinalizer)
+	if err := r.Update(ctx, sim); err != nil {
+		return true, ctrl.Result{}, err
 	}
 
-	// 3) Decide namespace name (simple deterministic naming for MVP)
-	simNS := sim.Status.Namespace
-	if simNS == "" {
-		// Option A: human-readable (may collide if names reused)
-		// simNS = fmt.Sprintf("netsim-%s", sim.Name)
+	return true, ctrl.Result{}, nil
+}
 
-		// Option B (safer): include short uid to avoid collisions
-		uid := string(sim.UID)
-		short := uid
-		if len(uid) > 8 {
-			short = uid[:8]
-		}
-		simNS = fmt.Sprintf("netsim-%s-%s", sim.Name, short)
+func (r *NetworkSimulationReconciler) ensureFinalizer(
+	ctx context.Context,
+	sim *simv1alpha1.NetworkSimulation,
+) (bool, ctrl.Result, error) {
+	if controllerutil.ContainsFinalizer(sim, simFinalizer) {
+		return false, ctrl.Result{}, nil
 	}
 
-	// 4) Ensure namespace exists
+	controllerutil.AddFinalizer(sim, simFinalizer)
+	if err := r.Update(ctx, sim); err != nil {
+		return true, ctrl.Result{}, err
+	}
+
+	return true, ctrl.Result{RequeueAfter: RequeueTimer}, nil
+}
+
+func generateNamespace(sim *simv1alpha1.NetworkSimulation) string {
+	if sim.Status.Namespace != "" {
+		return sim.Status.Namespace
+	}
+
+	uid := string(sim.UID)
+	short := uid
+	if len(uid) > 8 {
+		short = uid[:8]
+	}
+
+	name := strings.ToLower(sim.Name)
+	ns := fmt.Sprintf("netsim-%s-%s", name, short)
+	if len(ns) > 63 {
+		ns = ns[:63]
+	}
+	return strings.TrimRight(ns, "-")
+}
+
+func (r *NetworkSimulationReconciler) reconcileInfrastructure(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+) error {
+
+	if err := r.ensureNamespace(ctx, logger, sim, namespace); err != nil {
+		return err
+	}
+
+	if err := r.ensureDevicePods(ctx, logger, sim, namespace); err != nil {
+		return err
+	}
+
+	if err := r.ensureDeviceService(ctx, logger, sim, namespace); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *NetworkSimulationReconciler) ensureNamespace(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+) error {
 	var ns corev1.Namespace
-	err := r.Get(ctx, types.NamespacedName{Name: simNS}, &ns)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			ns = corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: simNS,
-					Labels: map[string]string{
-						"sim.example.local/owner": sim.Name,
-					},
-				},
-			}
-			if err := r.Create(ctx, &ns); err != nil {
-				logger.Error(err, "Failed to create simulation namespace", "namespace", simNS)
-				return ctrl.Result{}, err
-			}
-			logger.Info("Created simulation namespace", "namespace", simNS)
-		} else {
-			return ctrl.Result{}, err
-		}
+	err := r.Get(ctx, types.NamespacedName{Name: namespace}, &ns)
+	if err == nil {
+		return nil
 	}
 
-	// 5) Update status (phase + namespace)
-	// Only update if needed to avoid hot loops.
-	desiredPhase := sim.Status.Phase
-	if desiredPhase == "" {
-		desiredPhase = "Pending"
-	}
-	if sim.Status.Namespace != simNS || sim.Status.Phase != desiredPhase {
-		sim.Status.Namespace = simNS
-		sim.Status.Phase = desiredPhase
-		if err := r.Status().Update(ctx, &sim); err != nil {
-			logger.Error(err, "Failed to update status")
-			return ctrl.Result{}, err
-		}
-		logger.Info("Updated status", "phase", sim.Status.Phase, "namespace", sim.Status.Namespace)
-
+	if !apierrors.IsNotFound(err) {
+		return err
 	}
 
-	// 6) Ensure device pods exist
-	desired := sim.Spec.DeviceCount
-	if desired < 0 {
-		desired = 0
+	ns = corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: namespace,
+			Labels: map[string]string{
+				"sim.example.local/owner": sim.Name,
+			},
+		},
 	}
+
+	if err := r.Create(ctx, &ns); err != nil {
+		logger.Error(err, "Failed to create simulation namespace", "namespace", namespace)
+		return err
+	}
+
+	logger.Info("Created simulation namespace", "namespace", namespace)
+	return nil
+}
+
+func (r *NetworkSimulationReconciler) ensureDevicePods(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+) error {
+	desired := desiredDeviceCount(sim)
+
 	for i := 0; i < desired; i++ {
-		podName := fmt.Sprintf("device-%d", i)
-
-		var pod corev1.Pod
-		err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: simNS}, &pod)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				newPod := corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      podName,
-						Namespace: simNS,
-						Labels: map[string]string{
-							simLabelKey:  sim.Name,
-							roleLabelKey: "device",
-						},
-					},
-					Spec: corev1.PodSpec{
-						Hostname:  podName,
-						Subdomain: "devices",
-						Containers: []corev1.Container{
-							{
-								Name:    "device",
-								Image:   "ghcr.io/nicolaka/netshoot:latest",
-								Command: []string{"sh", "-c", "sleep 365d"},
-							},
-						},
-						RestartPolicy: corev1.RestartPolicyAlways,
-					},
-				}
-
-				// Optional: set owner reference so garbage collection cleans pods
-				// NOTE: Pods are in a different namespace than the CR, so OwnerReferences
-				// do NOT work across namespaces. We'll rely on namespace deletion instead.
-
-				if err := r.Create(ctx, &newPod); err != nil {
-					logger.Error(err, "Failed to create device pod", "pod", podName, "namespace", simNS)
-					return ctrl.Result{}, err
-				}
-			}
+		podName := devicePodName(i)
+		if err := r.ensureDevicePod(ctx, logger, sim, namespace, podName); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
-	// 6.5) Ensure headless service exists
-	svcName := "devices"
+func (r *NetworkSimulationReconciler) ensureDeviceService(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+) error {
+	const svcName = "devices"
+
 	var svc corev1.Service
-	err = r.Get(ctx, types.NamespacedName{Name: svcName, Namespace: simNS}, &svc)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			svc = corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      svcName,
-					Namespace: simNS,
-					Labels: map[string]string{
-						simLabelKey: sim.Name,
-					},
-				},
-				Spec: corev1.ServiceSpec{
-					ClusterIP: corev1.ClusterIPNone, // headless
-					Selector: map[string]string{
-						roleLabelKey: "device",
-					},
-					PublishNotReadyAddresses: true, // optional; helps if you want DNS before Ready
-				},
-			}
-			if err := r.Create(ctx, &svc); err != nil {
-				if apierrors.IsAlreadyExists(err) {
-					//fine
-				} else {
-					logger.Error(err, "Failed to create headless service", "service", svcName, "namespace", simNS)
-					return ctrl.Result{}, err
-				}
-			}
-			logger.Info("Created headless service", "service", svcName, "namespace", simNS)
-		} else {
-			return ctrl.Result{}, err
-		}
+	err := r.Get(ctx, types.NamespacedName{Name: svcName, Namespace: namespace}, &svc)
+	if err == nil {
+		return nil
 	}
-	// 7) Check readiness of device pods
+
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	svc = corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      svcName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				simLabelKey: sim.Name,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: corev1.ClusterIPNone,
+			Selector: map[string]string{
+				roleLabelKey: "device",
+			},
+			PublishNotReadyAddresses: true,
+		},
+	}
+
+	if err := r.Create(ctx, &svc); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
+		logger.Error(err, "Failed to create headless service", "service", svcName, "namespace", namespace)
+		return err
+	}
+
+	logger.Info("Created headless service", "service", svcName, "namespace", namespace)
+	return nil
+}
+
+func (r *NetworkSimulationReconciler) reconcileReadiness(
+	ctx context.Context,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+) (phase string, readyCount int, result ctrl.Result, err error) {
+	desired := desiredDeviceCount(sim)
+
+	readyCount, err = r.countReadyDevicePods(ctx, namespace)
+	if err != nil {
+		return "", 0, ctrl.Result{}, err
+	}
+
+	phase = calculateSimulationPhase(sim.Status.Phase, desired, readyCount)
+
+	if desired > 0 && readyCount < desired {
+		result = ctrl.Result{RequeueAfter: RequeueTimer}
+	}
+
+	return phase, readyCount, result, nil
+}
+
+func desiredDeviceCount(sim *simv1alpha1.NetworkSimulation) int {
+	if sim.Spec.DeviceCount < 0 {
+		return 0
+	}
+	return sim.Spec.DeviceCount
+}
+
+func (r *NetworkSimulationReconciler) countReadyDevicePods(
+	ctx context.Context,
+	namespace string,
+) (int, error) {
 	var podList corev1.PodList
-	if err := r.List(ctx, &podList, client.InNamespace(simNS), client.MatchingLabels{roleLabelKey: "device"}); err != nil {
-		return ctrl.Result{}, err
+	if err := r.List(
+		ctx,
+		&podList,
+		client.InNamespace(namespace),
+		client.MatchingLabels{roleLabelKey: "device"},
+	); err != nil {
+		return 0, err
 	}
 
 	readyCount := 0
@@ -255,96 +351,40 @@ func (r *NetworkSimulationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		}
 	}
 
-	newPhase := sim.Status.Phase
-	if newPhase == "" {
-		newPhase = "Pending"
+	return readyCount, nil
+}
+
+func calculateSimulationPhase(currentPhase string, desired, ready int) string {
+	phase := currentPhase
+	if phase == "" {
+		phase = PhasePending
 	}
+
 	if desired > 0 {
-		newPhase = "Running"
-		if readyCount == desired {
-			newPhase = "Ready"
+		phase = PhaseRunning
+		if ready == desired {
+			phase = PhaseReady
 		}
 	}
 
-	// Update status if changed (phase + namespace)
-	if sim.Status.Namespace != simNS || sim.Status.Phase != newPhase {
-		sim.Status.Namespace = simNS
-		sim.Status.Phase = newPhase
-		if err := r.Status().Update(ctx, &sim); err != nil {
-			if apierrors.IsConflict(err) {
-				logger.Info("Status update conflict, requeueing")
-				return ctrl.Result{Requeue: true}, nil
-			}
-			logger.Error(err, "Failed to update status")
-			return ctrl.Result{}, err
-		}
-		logger.Info("Updated status", "phase", sim.Status.Phase, "namespace", sim.Status.Namespace, "ready", readyCount, "desired", desired)
+	return phase
+}
+
+func (r *NetworkSimulationReconciler) reconcileTraffic(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+) (string, error) {
+
+	script := buildTrafficScripts(sim)
+	jobName := trafficJobName(sim)
+
+	if err := r.ensureTrafficJob(ctx, logger, sim, namespace, jobName, script); err != nil {
+		return "", err
 	}
 
-	// If not ready yet, requeue soon
-	if desired > 0 && readyCount < desired {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
-
-	script := buildTrafficScripts(&sim)
-	jobName := trafficJobName(&sim)
-	backoff := int32(0)
-
-	if sim.Status.TrafficJobName != jobName {
-		sim.Status.TrafficJobName = jobName
-		if err := r.Status().Update(ctx, &sim); err != nil {
-			if apierrors.IsConflict(err) {
-				return ctrl.Result{RequeueAfter: 5}, nil
-			}
-			logger.Error(err, "Failed to update traffic job name in status")
-			return ctrl.Result{}, err
-		}
-	}
-
-	var job batchv1.Job
-	err = r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: simNS}, &job)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			job = batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      jobName,
-					Namespace: simNS,
-					Labels: map[string]string{
-						simLabelKey: sim.Name,
-					},
-				},
-				Spec: batchv1.JobSpec{
-					BackoffLimit: &backoff,
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{
-							RestartPolicy: corev1.RestartPolicyNever,
-							Containers: []corev1.Container{
-								{
-									Name:    "traffick",
-									Image:   "ghcr.io/nicolaka/netshoot:latest",
-									Command: []string{"sh", "-c", script},
-								},
-							},
-						},
-					},
-				},
-			}
-			if err := r.Create(ctx, &job); err != nil {
-				if apierrors.IsAlreadyExists(err) {
-					logger.Info("Traffic job already exists", "job", jobName, "namespace", simNS)
-				} else {
-					logger.Error(err, "Failed to create traffic job", "job", jobName, "namespace", simNS)
-					return ctrl.Result{}, err
-				}
-			} else {
-				logger.Info("Created traffic job", "job", jobName, "namespace", simNS)
-			}
-		} else {
-			return ctrl.Result{}, err
-		}
-	}
-
-	return ctrl.Result{}, nil
+	return jobName, nil
 }
 
 func buildTrafficScripts(sim *simv1alpha1.NetworkSimulation) string {
@@ -398,6 +438,196 @@ func isPodReady(p *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+func (r *NetworkSimulationReconciler) ensureTrafficJob(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+	jobName string,
+	script string,
+) error {
+	var job batchv1.Job
+	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: namespace}, &job)
+	if err == nil {
+		return nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	job = buildTrafficJob(sim, namespace, jobName, script)
+
+	if err := r.Create(ctx, &job); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			logger.Info("Traffic job already exists", "job", jobName, "namespace", namespace)
+			return nil
+		}
+		logger.Error(err, "Failed to create traffic job", "job", jobName, "namespace", namespace)
+		return err
+	}
+
+	logger.Info("Created traffic job", "job", jobName, "namespace", namespace)
+	return nil
+}
+
+func devicePodName(i int) string {
+	return fmt.Sprintf("device-%d", i)
+}
+
+func buildDevicePod(sim *simv1alpha1.NetworkSimulation, namespace, podName string) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				simLabelKey:  sim.Name,
+				roleLabelKey: "device",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Hostname:  podName,
+			Subdomain: "devices",
+			Containers: []corev1.Container{
+				{
+					Name:    "device",
+					Image:   "ghcr.io/nicolaka/netshoot:latest",
+					Command: []string{"sh", "-c", "sleep 365d"},
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyAlways,
+		},
+	}
+}
+
+func (r *NetworkSimulationReconciler) ensureDevicePod(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace, podName string,
+) error {
+	var pod corev1.Pod
+	err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, &pod)
+	if err == nil {
+		return nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	newPod := buildDevicePod(sim, namespace, podName)
+
+	if err := r.Create(ctx, &newPod); err != nil {
+		logger.Error(err, "Failed to create device pod", "pod", podName, "namespace", namespace)
+		return err
+	}
+
+	logger.Info("Created device pod", "pod", podName, "namespace", namespace)
+	return nil
+}
+
+func (r *NetworkSimulationReconciler) reconcileStatus(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+	phase string,
+	trafficJobName string,
+) error {
+	changed := false
+
+	if sim.Status.Namespace != namespace {
+		sim.Status.Namespace = namespace
+		changed = true
+	}
+	if sim.Status.Phase != phase {
+		sim.Status.Phase = phase
+		changed = true
+	}
+	if sim.Status.TrafficJobName != trafficJobName {
+		sim.Status.TrafficJobName = trafficJobName
+		changed = true
+	}
+
+	if !changed {
+		return nil
+	}
+
+	if err := r.Status().Update(ctx, sim); err != nil {
+		logger.Error(err, "Failed to update status")
+		return err
+	}
+
+	logger.Info("Updated simulation status",
+		"namespace", sim.Status.Namespace,
+		"phase", sim.Status.Phase,
+		"trafficJobName", sim.Status.TrafficJobName,
+	)
+	return nil
+}
+
+func (r *NetworkSimulationReconciler) updateSimulationStatus(
+	ctx context.Context,
+	logger logr.Logger,
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+	phase string,
+) error {
+	if sim.Status.Namespace == namespace && sim.Status.Phase == phase {
+		return nil
+	}
+
+	sim.Status.Namespace = namespace
+	sim.Status.Phase = phase
+
+	if err := r.Status().Update(ctx, sim); err != nil {
+		logger.Error(err, "Failed to update status")
+		return err
+	}
+
+	logger.Info("Updated status",
+		"phase", sim.Status.Phase,
+		"namespace", sim.Status.Namespace,
+	)
+
+	return nil
+}
+
+func buildTrafficJob(
+	sim *simv1alpha1.NetworkSimulation,
+	namespace string,
+	jobName string,
+	script string,
+) batchv1.Job {
+	backoff := int32(0)
+
+	return batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				simLabelKey: sim.Name,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: &backoff,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "traffic",
+							Image:   "ghcr.io/nicolaka/netshoot:latest",
+							Command: []string{"sh", "-c", script},
+						},
+					},
+				},
+			},
+		},
+	}
 }
 
 // SetupWithManager sets up the controller with the Manager.
