@@ -37,7 +37,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	simv1alpha1 "github.com/Haakon89/netsim-operator/api/v1alpha1"
-	"github.com/go-logr/logr"
 )
 
 const (
@@ -72,7 +71,7 @@ func (r *NetworkSimulationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if handled, result, err := r.handleDeletion(ctx, logger, &sim); handled {
+	if handled, result, err := r.handleDeletion(ctx, &sim); handled {
 		return result, err
 	}
 	if handled, result, err := r.ensureFinalizer(ctx, &sim); handled {
@@ -81,7 +80,7 @@ func (r *NetworkSimulationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	simNS := generateNamespace(&sim)
 
-	if err := r.reconcileInfrastructure(ctx, logger, &sim, simNS); err != nil {
+	if err := r.reconcileInfrastructure(ctx, &sim, simNS); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -90,12 +89,12 @@ func (r *NetworkSimulationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return result, err
 	}
 
-	jobName, err := r.reconcileTraffic(ctx, logger, &sim, simNS)
+	jobName, err := r.reconcileTraffic(ctx, &sim, simNS)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if err := r.reconcileStatus(ctx, logger, &sim, simNS, phase, jobName); err != nil {
+	if err := r.reconcileStatus(ctx, &sim, simNS, phase, jobName); err != nil {
 		if apierrors.IsConflict(err) {
 			return ctrl.Result{Requeue: true}, nil
 		}
@@ -108,9 +107,9 @@ func (r *NetworkSimulationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 func (r *NetworkSimulationReconciler) handleDeletion(
 	ctx context.Context,
-	logger logr.Logger,
 	sim *simv1alpha1.NetworkSimulation,
 ) (bool, ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 	if sim.DeletionTimestamp.IsZero() {
 		return false, ctrl.Result{}, nil
 	}
@@ -184,20 +183,19 @@ func generateNamespace(sim *simv1alpha1.NetworkSimulation) string {
 
 func (r *NetworkSimulationReconciler) reconcileInfrastructure(
 	ctx context.Context,
-	logger logr.Logger,
 	sim *simv1alpha1.NetworkSimulation,
 	namespace string,
 ) error {
 
-	if err := r.ensureNamespace(ctx, logger, sim, namespace); err != nil {
+	if err := r.ensureNamespace(ctx, sim, namespace); err != nil {
 		return err
 	}
 
-	if err := r.ensureDevicePods(ctx, logger, sim, namespace); err != nil {
+	if err := r.ensureDevicePods(ctx, sim, namespace); err != nil {
 		return err
 	}
 
-	if err := r.ensureDeviceService(ctx, logger, sim, namespace); err != nil {
+	if err := r.ensureDeviceService(ctx, sim, namespace); err != nil {
 		return err
 	}
 
@@ -206,10 +204,10 @@ func (r *NetworkSimulationReconciler) reconcileInfrastructure(
 
 func (r *NetworkSimulationReconciler) ensureNamespace(
 	ctx context.Context,
-	logger logr.Logger,
 	sim *simv1alpha1.NetworkSimulation,
 	namespace string,
 ) error {
+	logger := log.FromContext(ctx)
 	var ns corev1.Namespace
 	err := r.Get(ctx, types.NamespacedName{Name: namespace}, &ns)
 	if err == nil {
@@ -240,7 +238,6 @@ func (r *NetworkSimulationReconciler) ensureNamespace(
 
 func (r *NetworkSimulationReconciler) ensureDevicePods(
 	ctx context.Context,
-	logger logr.Logger,
 	sim *simv1alpha1.NetworkSimulation,
 	namespace string,
 ) error {
@@ -248,7 +245,7 @@ func (r *NetworkSimulationReconciler) ensureDevicePods(
 
 	for i := 0; i < desired; i++ {
 		podName := devicePodName(i)
-		if err := r.ensureDevicePod(ctx, logger, sim, namespace, podName); err != nil {
+		if err := r.ensureDevicePod(ctx, sim, namespace, podName); err != nil {
 			return err
 		}
 	}
@@ -257,10 +254,11 @@ func (r *NetworkSimulationReconciler) ensureDevicePods(
 
 func (r *NetworkSimulationReconciler) ensureDeviceService(
 	ctx context.Context,
-	logger logr.Logger,
 	sim *simv1alpha1.NetworkSimulation,
 	namespace string,
 ) error {
+	logger := log.FromContext(ctx)
+
 	const svcName = "devices"
 
 	var svc corev1.Service
@@ -372,10 +370,10 @@ func calculateSimulationPhase(currentPhase string, desired, ready int) string {
 
 func (r *NetworkSimulationReconciler) reconcileTraffic(
 	ctx context.Context,
-	logger logr.Logger,
 	sim *simv1alpha1.NetworkSimulation,
 	namespace string,
 ) (string, error) {
+	logger := log.FromContext(ctx)
 
 	script := buildTrafficScripts(sim)
 	jobName := trafficJobName(sim)
@@ -442,12 +440,13 @@ func isPodReady(p *corev1.Pod) bool {
 
 func (r *NetworkSimulationReconciler) ensureTrafficJob(
 	ctx context.Context,
-	logger logr.Logger,
 	sim *simv1alpha1.NetworkSimulation,
 	namespace string,
 	jobName string,
 	script string,
 ) error {
+	logger := log.FromContext(ctx)
+
 	var job batchv1.Job
 	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: namespace}, &job)
 	if err == nil {
@@ -504,10 +503,11 @@ func buildDevicePod(sim *simv1alpha1.NetworkSimulation, namespace, podName strin
 
 func (r *NetworkSimulationReconciler) ensureDevicePod(
 	ctx context.Context,
-	logger logr.Logger,
 	sim *simv1alpha1.NetworkSimulation,
 	namespace, podName string,
 ) error {
+	logger := log.FromContext(ctx)
+
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, &pod)
 	if err == nil {
@@ -531,12 +531,13 @@ func (r *NetworkSimulationReconciler) ensureDevicePod(
 
 func (r *NetworkSimulationReconciler) reconcileStatus(
 	ctx context.Context,
-	logger logr.Logger,
 	sim *simv1alpha1.NetworkSimulation,
 	namespace string,
 	phase string,
 	trafficJobName string,
 ) error {
+	logger := log.FromContext(ctx)
+
 	changed := false
 
 	if sim.Status.Namespace != namespace {
@@ -566,33 +567,6 @@ func (r *NetworkSimulationReconciler) reconcileStatus(
 		"phase", sim.Status.Phase,
 		"trafficJobName", sim.Status.TrafficJobName,
 	)
-	return nil
-}
-
-func (r *NetworkSimulationReconciler) updateSimulationStatus(
-	ctx context.Context,
-	logger logr.Logger,
-	sim *simv1alpha1.NetworkSimulation,
-	namespace string,
-	phase string,
-) error {
-	if sim.Status.Namespace == namespace && sim.Status.Phase == phase {
-		return nil
-	}
-
-	sim.Status.Namespace = namespace
-	sim.Status.Phase = phase
-
-	if err := r.Status().Update(ctx, sim); err != nil {
-		logger.Error(err, "Failed to update status")
-		return err
-	}
-
-	logger.Info("Updated status",
-		"phase", sim.Status.Phase,
-		"namespace", sim.Status.Namespace,
-	)
-
 	return nil
 }
 
