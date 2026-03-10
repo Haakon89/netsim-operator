@@ -373,12 +373,10 @@ func (r *NetworkSimulationReconciler) reconcileTraffic(
 	sim *simv1alpha1.NetworkSimulation,
 	namespace string,
 ) (string, error) {
-	logger := log.FromContext(ctx)
-
 	script := buildTrafficScripts(sim)
 	jobName := trafficJobName(sim)
 
-	if err := r.ensureTrafficJob(ctx, logger, sim, namespace, jobName, script); err != nil {
+	if err := r.ensureTrafficJob(ctx, sim, namespace, jobName, script); err != nil {
 		return "", err
 	}
 
