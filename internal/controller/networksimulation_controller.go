@@ -85,8 +85,8 @@ func (r *NetworkSimulationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	phase, readyCount, result, err := r.reconcileReadiness(ctx, &sim, simNS)
-	if err != nil || !result.IsZero() {
-		return result, err
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	jobName, err := r.reconcileTraffic(ctx, &sim, simNS)
@@ -96,9 +96,12 @@ func (r *NetworkSimulationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	if err := r.reconcileStatus(ctx, &sim, simNS, phase, jobName); err != nil {
 		if apierrors.IsConflict(err) {
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	if !result.IsZero() {
+		return result, nil
 	}
 
 	logger.Info("Reconciled simulation", "namespace", simNS, "phase", phase, "ready", readyCount)
