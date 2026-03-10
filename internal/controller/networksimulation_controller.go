@@ -243,7 +243,7 @@ func (r *NetworkSimulationReconciler) ensureDevicePods(
 ) error {
 	desired := desiredDeviceCount(sim)
 
-	for i := 0; i < desired; i++ {
+	for i := range desired {
 		podName := devicePodName(i)
 		if err := r.ensureDevicePod(ctx, sim, namespace, podName); err != nil {
 			return err
